@@ -1,14 +1,26 @@
 # Production Docker Compose for Trinity Agent Platform
 #
-# Port allocation:
-#   - 8000: Trinity backend
-#   - 80: Trinity frontend (standard HTTP)
-#   - 8080: Trinity MCP server
-#   - 8001: Scheduler service (internal health check)
-#   - 8686: Vector log aggregator
-#   - 4317: OTel Collector gRPC (OTLP)
-#   - 4318: OTel Collector HTTP (OTLP)
-#   - 8889: OTel Prometheus metrics
+# TSA / Coolify variant (branch: tsa-coolify)
+# ------------------------------------------------------------------
+# FULLY DYNAMIC: every host-specific value is an env var with a sane
+# default, so this file is configured via Coolify env vars, NOT by
+# editing the file. See .env.tsa.example for the full list.
+#
+# Coolify owns the host's :80/:443 via its bundled Traefik. This compose
+# therefore publishes NO host ports; routed services expose their port
+# internally and are reached by Traefik over the external `coolify`
+# network using the labels below. Service-to-service traffic keeps using
+# Docker DNS (container names) on trinity's own networks.
+#
+# Internal port allocation (container-side, reached by name, NOT published):
+#   - 8000: Trinity backend          (Traefik: ${TRINITY_DOMAIN}/api)
+#   - 8080: Trinity frontend nginx   (Traefik: ${TRINITY_DOMAIN} root)
+#   - 8080: Trinity MCP server       (Traefik: ${TRINITY_DOMAIN}/mcp)
+#   - 8001: Scheduler service        (internal health check)
+#   - 8686: Vector log aggregator    (internal API only)
+#   - 4317: OTel Collector gRPC (OTLP, internal)
+#   - 4318: OTel Collector HTTP (OTLP, internal)
+#   - 8889: OTel Prometheus metrics  (internal)
 
 services:
   backend:
@@ -28,8 +40,11 @@ services:
         BUILD_DATE: ${BUILD_DATE:-unknown}
     container_name: trinity-backend
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+    # Coolify/Traefik owns 80/443 — no host port publish. Backend is reached
+    # internally as http://backend:8000 (Docker DNS) and externally via the
+    # Traefik labels below (${TRINITY_DOMAIN}/api).
+    expose:
+      - "8000"
     environment:
       - SECRET_KEY=${SECRET_KEY}
       - "ADMIN_PASSWORD=${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set in .env (admin login + MCP auth)}"
@@ -56,6 +71,15 @@ services:
       - NOTION_CLIENT_ID=${NOTION_CLIENT_ID}
       - NOTION_CLIENT_SECRET=${NOTION_CLIENT_SECRET}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Local-model passthrough for the PLATFORM process (optional). To point
+      # AGENT containers at our LiteLLM gateway, the backend must forward
+      # ANTHROPIC_BASE_URL into the per-agent env dict it builds in code —
+      # see src/backend/services/agent_service/crud.py:475 (and the recreate
+      # path at lifecycle.py:377). That is a one-line backend change, NOT done
+      # here. AGENT_ANTHROPIC_BASE_URL is staged below so it is available once
+      # that forward is added; harmless while unused.
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+      - AGENT_ANTHROPIC_BASE_URL=${AGENT_ANTHROPIC_BASE_URL:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}  # For Gemini-powered agents
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}  # For platform image generation (IMG-001)
       # Gemini model overrides (#1130) — mirrors docker-compose.yml; without these
@@ -89,10 +113,10 @@ services:
       - OTEL_LOGS_EXPORTER=${OTEL_LOGS_EXPORTER:-otlp}
       - OTEL_EXPORTER_OTLP_PROTOCOL=${OTEL_EXPORTER_OTLP_PROTOCOL:-grpc}
       - OTEL_METRIC_EXPORT_INTERVAL=${OTEL_METRIC_EXPORT_INTERVAL:-60000}
-      # Public external access URL (Tailscale Funnel, Cloudflare Tunnel, etc.)
+      # Public external access URL (Tailscale Funnel, Cloudflare Tunnel, Traefik, etc.)
       - PUBLIC_CHAT_URL=${PUBLIC_CHAT_URL:-}
-      # Frontend URL for post-OAuth redirects
-      - FRONTEND_URL=${FRONTEND_URL:-}
+      # Frontend URL for post-OAuth redirects (default to the Traefik domain)
+      - FRONTEND_URL=${FRONTEND_URL:-https://${TRINITY_DOMAIN:-trinity.tsunamiautomation.com}}
       # Internal API shared secret (C-003) - for scheduler/agent communication
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET}
     volumes:
@@ -101,7 +125,7 @@ services:
       - ./config/process-templates:/agent-configs/process-templates:ro
       - ./config/process-docs:/app/config/process-docs:ro
       - agent-configs:/agent-configs
-      - ${TRINITY_DATA_PATH:-./trinity-data}:/data
+      - ${TRINITY_DATA_PATH:-/mnt/tsa-runtime/trinity-data}:/data
     depends_on:
       redis:
         condition: service_healthy
@@ -110,6 +134,7 @@ services:
     networks:
       - trinity-platform   # Redis, scheduler, vector, OTel
       - trinity-agent      # Frontend, mcp-server, agent containers, cloudflared
+      - coolify            # Traefik routing for ${TRINITY_DOMAIN}/api
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -117,11 +142,10 @@ services:
     # No cap_add: backend listens on 8000 (>=1024, no NET_BIND_SERVICE needed)
     # and reaches /var/run/docker.sock via group_add below — not capabilities.
     # Issue #874: backend runs as UID 1000 (non-root) but still needs to talk
-    # to /var/run/docker.sock. On Linux the socket is group-owned by `docker`
-    # (typically GID 999 on Debian/Ubuntu, ~990 on RHEL family). macOS Docker
-    # Desktop ignores group_add; the default is safe there.
+    # to /var/run/docker.sock. On Linux the socket is group-owned by `docker`.
+    # TSA01 docker GID is 988 — overridable via DOCKER_GID.
     group_add:
-      - "${DOCKER_GID:-999}"
+      - "${DOCKER_GID:-988}"
     tmpfs:
       - /tmp:noexec,nosuid,size=100m
     # Production: no --reload flag
@@ -132,25 +156,38 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    labels:
+      - "traefik.enable=true"
+      # /api → backend:8000 (higher priority than the frontend catch-all)
+      - "traefik.http.routers.trinity-api.rule=Host(`${TRINITY_DOMAIN:-trinity.tsunamiautomation.com}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.trinity-api.entrypoints=websecure"
+      - "traefik.http.routers.trinity-api.tls=true"
+      - "traefik.http.routers.trinity-api.tls.certresolver=${TRINITY_CERT_RESOLVER:-letsencrypt}"
+      - "traefik.http.routers.trinity-api.priority=20"
+      - "traefik.http.routers.trinity-api.service=trinity-api"
+      - "traefik.http.services.trinity-api.loadbalancer.server.port=8000"
+      # Bind Traefik to the coolify network for this service
+      - "traefik.docker.network=coolify"
 
   frontend:
     build:
       context: ./src/frontend
       dockerfile: ../../docker/frontend/Dockerfile.prod
       args:
-        - VITE_API_URL=${VITE_API_URL:-http://localhost:8000}
+        - VITE_API_URL=${VITE_API_URL:-https://${TRINITY_DOMAIN:-trinity.tsunamiautomation.com}}
     image: trinity-frontend:prod
     container_name: trinity-frontend
     restart: unless-stopped
-    # Issue #874: container nginx binds 8080 (unprivileged). Host port 80
-    # preserved so external URLs do not change.
-    ports:
-      - "80:8080"
+    # Issue #874: container nginx binds 8080 (unprivileged). No host publish —
+    # Coolify/Traefik routes ${TRINITY_DOMAIN} root to this port.
+    expose:
+      - "8080"
     depends_on:
       backend:
         condition: service_healthy
     networks:
       - trinity-agent      # Frontend talks to backend on agent network
+      - coolify            # Traefik routing for ${TRINITY_DOMAIN} root
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -162,6 +199,17 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    labels:
+      - "traefik.enable=true"
+      # Catch-all root router (lowest priority so /api and /mcp win)
+      - "traefik.http.routers.trinity-frontend.rule=Host(`${TRINITY_DOMAIN:-trinity.tsunamiautomation.com}`)"
+      - "traefik.http.routers.trinity-frontend.entrypoints=websecure"
+      - "traefik.http.routers.trinity-frontend.tls=true"
+      - "traefik.http.routers.trinity-frontend.tls.certresolver=${TRINITY_CERT_RESOLVER:-letsencrypt}"
+      - "traefik.http.routers.trinity-frontend.priority=1"
+      - "traefik.http.routers.trinity-frontend.service=trinity-frontend"
+      - "traefik.http.services.trinity-frontend.loadbalancer.server.port=8080"
+      - "traefik.docker.network=coolify"
 
   redis:
     image: redis:7-alpine
@@ -272,7 +320,7 @@ services:
       - PUBLISH_EVENTS=true
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET}
     volumes:
-      - ${TRINITY_DATA_PATH:-./trinity-data}:/data
+      - ${TRINITY_DATA_PATH:-/mnt/tsa-runtime/trinity-data}:/data
     depends_on:
       redis:
         condition: service_healthy
@@ -300,8 +348,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./config/vector.yaml:/etc/vector/vector.yaml:ro
       - trinity-logs:/data/logs
-    ports:
-      - "8686:8686"  # Vector API (health checks)
+    # Vector API (health checks) reached internally only — no host publish.
+    expose:
+      - "8686"
     networks:
       - trinity-platform   # Vector reads via Docker socket, not network — platform side
     security_opt:
@@ -321,8 +370,10 @@ services:
       dockerfile: Dockerfile
     container_name: trinity-mcp-server
     restart: unless-stopped
-    ports:
-      - "8080:8080"
+    # Coolify/Traefik owns 80/443 — no host port publish. Reached internally
+    # as http://mcp-server:8080 and externally via ${TRINITY_DOMAIN}/mcp.
+    expose:
+      - "8080"
     environment:
       - NODE_ENV=production
       - MCP_PORT=8080
@@ -342,6 +393,7 @@ services:
       # via Docker DNS on the agent network; backend reaches it on platform network.
       - trinity-platform
       - trinity-agent
+      - coolify            # Traefik routing for ${TRINITY_DOMAIN}/mcp
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -354,10 +406,24 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    labels:
+      - "traefik.enable=true"
+      # /mcp → mcp-server:8080 (priority above the frontend catch-all)
+      - "traefik.http.routers.trinity-mcp.rule=Host(`${TRINITY_DOMAIN:-trinity.tsunamiautomation.com}`) && PathPrefix(`/mcp`)"
+      - "traefik.http.routers.trinity-mcp.entrypoints=websecure"
+      - "traefik.http.routers.trinity-mcp.tls=true"
+      - "traefik.http.routers.trinity-mcp.tls.certresolver=${TRINITY_CERT_RESOLVER:-letsencrypt}"
+      - "traefik.http.routers.trinity-mcp.priority=20"
+      - "traefik.http.routers.trinity-mcp.service=trinity-mcp"
+      - "traefik.http.services.trinity-mcp.loadbalancer.server.port=8080"
+      - "traefik.docker.network=coolify"
 
   # Cloudflare Tunnel - public endpoint access (Telegram webhooks, public chat, Slack OAuth)
   # Only starts when explicitly enabled via: docker compose --profile tunnel up -d
   # Requires TUNNEL_TOKEN from Cloudflare Zero Trust dashboard
+  # NOTE: With Coolify/Traefik fronting ${TRINITY_DOMAIN}, the tunnel is
+  # OPTIONAL — keep it disabled unless you need a Cloudflare path in addition
+  # to Traefik.
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: trinity-cloudflared
@@ -387,11 +453,12 @@ services:
     image: otel/opentelemetry-collector-contrib:0.120.0
     container_name: trinity-otel-collector
     restart: unless-stopped
-    ports:
-      - "4317:4317"   # gRPC receiver (OTLP)
-      - "4318:4318"   # HTTP receiver (OTLP)
-      - "8889:8889"   # Prometheus metrics exporter
-      - "13133:13133" # Health check endpoint
+    # No host publish — receivers/exporters are reached internally only.
+    expose:
+      - "4317"   # gRPC receiver (OTLP)
+      - "4318"   # HTTP receiver (OTLP)
+      - "8889"   # Prometheus metrics exporter
+      - "13133"  # Health check endpoint
     volumes:
       - ./config/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
     networks:
@@ -412,23 +479,34 @@ volumes:
   redis-data:
   trinity-logs:  # Vector log storage
   # trinity-data: using bind mount via TRINITY_DATA_PATH env var
+  #   default /mnt/tsa-runtime/trinity-data (TSA01 root disk is full; data
+  #   must live on /mnt/tsa-runtime). Override via TRINITY_DATA_PATH.
 
 networks:
   # Platform-internal network: Redis, scheduler, backend, mcp-server, vector, otel.
   # Agents NEVER join this network — Issue #589 (Redis lockdown).
+  # Subnet is env-driven (TRINITY_PLATFORM_SUBNET) so it never collides with
+  # existing TSA01 docker networks; default 172.16.0.0/16 is free on TSA01.
+  # Network NAME is preserved — backend code references trinity-platform-network.
   trinity-platform:
     driver: bridge
     name: trinity-platform-network
     ipam:
       config:
-        - subnet: 172.29.0.0/16
+        - subnet: ${TRINITY_PLATFORM_SUBNET:-172.16.0.0/16}
   # Agent-facing network: agents, frontend, plus the bridges that need to reach
   # them (backend, mcp-server, otel-collector, cloudflared). Name preserved so
   # the three agent-creation sites in services/agent_service/* and
   # system_agent_service.py need zero code changes.
+  # Subnet env-driven (TRINITY_AGENT_SUBNET); default 10.50.0.0/16 is free on TSA01.
   trinity-agent:
     driver: bridge
     name: trinity-agent-network
     ipam:
       config:
-        - subnet: 172.28.0.0/16
+        - subnet: ${TRINITY_AGENT_SUBNET:-10.50.0.0/16}
+  # Coolify's shared proxy network (Traefik lives here). External: Coolify
+  # creates and owns it. Routed services (frontend, backend, mcp-server) join
+  # it so Traefik can reach them by the labels above.
+  coolify:
+    external: true
